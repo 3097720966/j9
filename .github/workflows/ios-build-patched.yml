@@ -150,6 +150,16 @@ jobs:
                   }
               }
 
+              /// 给 App target 里的 supportedInterfaceOrientations 覆写用：返回当前锁定的方向 mask（0 = 跟随系统）
+              pub fn lock_mask() -> usize {
+                  let code = MODE.load(Ordering::SeqCst);
+                  if code == 0 {
+                      0
+                  } else {
+                      super::ScreenOrientation::from_code(code).mask()
+                  }
+              }
+
               fn cls(name: &CStr) -> Result<&'static AnyClass, String> {
                   AnyClass::get(name).ok_or_else(|| format!("class {name:?} unavailable"))
               }
@@ -267,6 +277,20 @@ jobs:
           pub fn current() -> Result<ScreenOrientation, String> {
               Ok(ScreenOrientation::Auto)
           }
+
+          /// 供 iOS App target（main.mm）调用：当前锁定方向，0 表示未锁定。
+          #[unsafe(no_mangle)]
+          pub extern "C" fn tt_lock_orientation_mask() -> usize {
+              #[cfg(target_os = "ios")]
+              {
+                  bridge::lock_mask()
+              }
+              #[cfg(not(target_os = "ios"))]
+              {
+                  0
+              }
+          }
+
           TT_ORIENT_RS
 
           cat > "$CRATE/src/presentation/commands/orientation_commands.rs" <<'TT_CMD_RS'
@@ -302,6 +326,85 @@ jobs:
           }
           TT_CMD_RS
 
+          # iOS App target：把 supportedInterfaceOrientations 覆写进 main.mm（硬锁的关键）
+          cat > /tmp/tt_lock.inc <<'TT_LOCK_MM'
+          // TauriTavern 横屏硬锁（本地补丁，非上游代码）
+          // 覆盖根视图控制器的 -supportedInterfaceOrientations：锁定态只允许横屏，
+          // 系统便不会再按设备姿态/前后台切换把方向转回竖屏。未锁定时原样交还原实现。
+          #import <UIKit/UIKit.h>
+          #import <objc/runtime.h>
+
+          extern "C" unsigned long tt_lock_orientation_mask(void);
+
+          static IMP TTLockOriginalIMP = NULL;
+          static Class TTLockInstalledClass = Nil;
+
+          static NSUInteger TTLockDefaultMask(void) {
+          	return UIInterfaceOrientationMaskPortrait | UIInterfaceOrientationMaskLandscapeLeft | UIInterfaceOrientationMaskLandscapeRight;
+          }
+
+          static NSUInteger TTLockSupportedOrientationsHook(id self, SEL _cmd) {
+          	NSUInteger lock = tt_lock_orientation_mask();
+          	if (lock != 0) {
+          		return lock;
+          	}
+          	if (TTLockOriginalIMP != NULL) {
+          		NSUInteger (*original)(id, SEL) = (NSUInteger (*)(id, SEL))TTLockOriginalIMP;
+          		return original(self, _cmd);
+          	}
+          	return TTLockDefaultMask();
+          }
+
+          static void TTLockInstall(UIViewController *viewController) {
+          	if (viewController == nil) {
+          		return;
+          	}
+          	Class cls = object_getClass(viewController);
+          	if (cls == Nil || cls == TTLockInstalledClass) {
+          		return;
+          	}
+          	SEL sel = @selector(supportedInterfaceOrientations);
+          	Method method = class_getInstanceMethod(cls, sel);
+          	if (method == NULL) {
+          		return;
+          	}
+          	TTLockOriginalIMP = method_getImplementation(method);
+          	if (!class_addMethod(cls, sel, (IMP)TTLockSupportedOrientationsHook, method_getTypeEncoding(method))) {
+          		method_setImplementation(method, (IMP)TTLockSupportedOrientationsHook);
+          	}
+          	TTLockInstalledClass = cls;
+          }
+
+          static void TTLockSweep(void) {
+          	UIApplication *app = UIApplication.sharedApplication;
+          	UIWindow *key = nil;
+          	for (UIWindow *window in app.windows) {
+          		if (window.isKeyWindow) {
+          			key = window;
+          			break;
+          		}
+          	}
+          	if (key == nil && app.windows.count > 0) {
+          		key = app.windows.firstObject;
+          	}
+          	if (key != nil) {
+          		TTLockInstall(key.rootViewController);
+          	}
+          }
+
+          __attribute__((constructor)) static void TTLockSetup(void) {
+          	NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+          	[center addObserverForName:UIWindowDidBecomeKeyNotification object:nil queue:nil usingBlock:^(NSNotification *note) {
+          		(void)note;
+          		TTLockSweep();
+          	}];
+          	[center addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:nil usingBlock:^(NSNotification *note) {
+          		(void)note;
+          		TTLockSweep();
+          	}];
+          }
+          TT_LOCK_MM
+
           python3 - "$CRATE" <<'TT_PY'
           import pathlib, sys
           crate = pathlib.Path(sys.argv[1])
@@ -316,6 +419,17 @@ jobs:
               path.write_text(text.replace(anchor, anchor + "\n" + line, 1), encoding="utf-8")
               print("patched:", path.name)
 
+          main_mm = crate/"gen/apple/Sources/tauritavern/main.mm"
+          text = main_mm.read_text(encoding="utf-8")
+          if "TTLockSupportedOrientationsHook" in text:
+              print("skip: main.mm already patched")
+          else:
+              include = '#include "bindings/bindings.h"'
+              if include not in text:
+                  raise SystemExit("anchor not found in main.mm")
+              block = pathlib.Path("/tmp/tt_lock.inc").read_text(encoding="utf-8")
+              main_mm.write_text(text.replace(include, include + "\n\n" + block, 1), encoding="utf-8")
+              print("patched: main.mm")
           ensure_line(crate/"src/platform/mod.rs", "pub mod lan_discovery;", "pub mod orientation;")
           ensure_line(crate/"src/presentation/commands/mod.rs", "pub mod mcp_commands;", "pub mod orientation_commands;")
           ensure_line(
