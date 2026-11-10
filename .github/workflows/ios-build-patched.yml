@@ -145,7 +145,8 @@ jobs:
           	[[UIDevice currentDevice] setValue:@(orientation) forKey:@"orientation"];
           }
 
-          extern "C" int tt_set_screen_orientation(int mode) {
+          extern "C" __attribute__((visibility("default")))
+          int tt_set_screen_orientation(int mode) {
           	dispatch_async(dispatch_get_main_queue(), ^{
           		switch (mode) {
           			case 1:
@@ -165,7 +166,8 @@ jobs:
           	return 0;
           }
 
-          extern "C" int tt_get_screen_orientation(void) {
+          extern "C" __attribute__((visibility("default")))
+          int tt_get_screen_orientation(void) {
           	if (TTLockedMask == 0) {
           		return 0;
           	}
@@ -174,6 +176,13 @@ jobs:
           	}
           	return 2;
           }
+
+          // Rust 侧用 dlsym 动态查找这两个函数，这里放一个静态引用，
+          // 防止链接器和 dead_strip 把符号优化掉。
+          __attribute__((used)) static void *const TTKeepBridgeSymbols[] = {
+          	(void *)&tt_set_screen_orientation,
+          	(void *)&tt_get_screen_orientation,
+          };
 
           int main(int argc, char * argv[]) {
           	ffi::start_app();
@@ -184,8 +193,10 @@ jobs:
           cat > "$CRATE/src/platform/orientation.rs" <<'TT_ORIENT_RS'
           //! 屏幕方向桥（本地补丁，非上游代码）。
           //!
-          //! iOS 侧实现在 `gen/apple/Sources/tauritavern/main.mm` 的 `tt_set_screen_orientation`。
-          //! 其它平台目前只返回“不支持”。
+          //! iOS 侧实现在 `gen/apple/Sources/tauritavern/main.mm` 的 `tt_set_screen_orientation` /
+          //! `tt_get_screen_orientation`。Rust 库是 dylib，编译时看不到 App 侧的符号，
+          //! 所以这里用 dlsym 运行时查找，避免链接期 undefined symbol。
+          //! 其它平台只返回“不支持”。
 
           #[derive(Clone, Copy, Debug, PartialEq, Eq)]
           pub enum ScreenOrientation {
@@ -215,17 +226,59 @@ jobs:
           }
 
           #[cfg(target_os = "ios")]
-          unsafe extern "C" {
-              fn tt_set_screen_orientation(mode: i32) -> i32;
-              fn tt_get_screen_orientation() -> i32;
+          mod bridge {
+              use core::ffi::{c_char, c_void};
+
+              // RTLD_DEFAULT：在当前进程已加载的所有镜像里查找符号
+              const RTLD_DEFAULT_OFFSET: isize = -2;
+
+              unsafe extern "C" {
+                  fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+              }
+
+              type SetFn = unsafe extern "C" fn(i32) -> i32;
+              type GetFn = unsafe extern "C" fn() -> i32;
+
+              fn find(name: &[u8]) -> Option<*mut c_void> {
+                  // SAFETY: name 是以 NUL 结尾的合法 C 字符串字面量。
+                  let p = unsafe { dlsym(RTLD_DEFAULT_OFFSET as *mut c_void, name.as_ptr() as *const c_char) };
+                  if p.is_null() {
+                      None
+                  } else {
+                      Some(p)
+                  }
+              }
+
+              const MISSING: &str = "orientation bridge is not compiled into this build";
+
+              pub fn set_code(code: i32) -> Result<(), String> {
+                  match find(b"tt_set_screen_orientation\0") {
+                      // SAFETY: 符号由 main.mm 导出，签名与声明一致。
+                      Some(sym) => {
+                          let f: SetFn = unsafe { core::mem::transmute(sym) };
+                          unsafe { f(code) };
+                          Ok(())
+                      }
+                      None => Err(MISSING.to_string()),
+                  }
+              }
+
+              pub fn get_code() -> Result<i32, String> {
+                  match find(b"tt_get_screen_orientation\0") {
+                      // SAFETY: 同上。
+                      Some(sym) => {
+                          let f: GetFn = unsafe { core::mem::transmute(sym) };
+                          Ok(unsafe { f() })
+                      }
+                      None => Err(MISSING.to_string()),
+                  }
+              }
           }
 
           pub fn set(orientation: ScreenOrientation) -> Result<(), String> {
               #[cfg(target_os = "ios")]
               {
-                  // SAFETY: 补丁里的实现只做 dispatch_async 到主线程，任意线程调用都是安全的。
-                  unsafe { tt_set_screen_orientation(orientation.code()) };
-                  Ok(())
+                  bridge::set_code(orientation.code())
               }
               #[cfg(not(target_os = "ios"))]
               {
@@ -237,7 +290,7 @@ jobs:
           pub fn current() -> Result<ScreenOrientation, String> {
               #[cfg(target_os = "ios")]
               {
-                  let code = unsafe { tt_get_screen_orientation() };
+                  let code = bridge::get_code()?;
                   Ok(match code {
                       1 => ScreenOrientation::Portrait,
                       2 => ScreenOrientation::Landscape,
