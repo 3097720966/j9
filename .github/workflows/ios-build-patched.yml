@@ -46,10 +46,15 @@ jobs:
           //!
           //! 全部走 objc2 直接调用 UIKit，不依赖 App target 里的 C 符号，
           //! 因此不会出现链接期 undefined symbol，也不受 -dead_strip / 符号可见性影响。
+          //!
+          //! 注意：这里刻意使用 `*mut AnyObject` 作为接收者/返回值，而不是 `Retained<T>`。
+          //! objc2 的 `msg_send!` 对 `Retained<T>` 要求 `T: Encode`，而 `AnyObject` / `NSObject`
+          //! 在这种写法下都不满足（编译期 E0277）。裸指针与 Objective-C 的对象返回在 ABI 上完全一致，
+          //! 这些对象生命周期都在当前调用内（主线程同步执行），不需要持有引用计数。
 
           #[derive(Clone, Copy, Debug, PartialEq, Eq)]
           pub enum ScreenOrientation {
-              /// 跟随系统（恢复三方向支持）
+              /// 跟随系统（恢复 plist 声明的三方向）
               Auto,
               Portrait,
               Landscape,
@@ -96,31 +101,43 @@ jobs:
 
           #[cfg(target_os = "ios")]
           mod bridge {
+              use std::ffi::CStr;
               use std::sync::atomic::{AtomicI32, Ordering};
 
               use block2::RcBlock;
               use objc2::msg_send;
-              use objc2::rc::Retained;
-              use objc2::runtime::AnyClass;
-              use objc2_foundation::{NSObject, NSString};
+              use objc2::runtime::{AnyClass, AnyObject};
+              use objc2_foundation::NSString;
 
               static MODE: AtomicI32 = AtomicI32::new(0);
 
-              fn cls(name: &std::ffi::CStr) -> Result<&'static AnyClass, String> {
+              fn cls(name: &CStr) -> Result<&'static AnyClass, String> {
                   AnyClass::get(name).ok_or_else(|| format!("class {name:?} unavailable"))
               }
 
               /// 取当前处于前台活跃状态的 UIScene（iOS 13+）
-              unsafe fn foreground_scene() -> Option<Retained<NSObject>> {
+              unsafe fn foreground_scene() -> Option<*mut AnyObject> {
                   let app_cls = AnyClass::get(c"UIApplication")?;
-                  let app: Retained<NSObject> = unsafe { msg_send![app_cls, sharedApplication] };
-                  let scenes: Retained<NSObject> = unsafe { msg_send![&*app, connectedScenes] };
-                  let arr: Retained<NSObject> = unsafe { msg_send![&*scenes, allObjects] };
-                  let count: usize = unsafe { msg_send![&*arr, count] };
+                  let app: *mut AnyObject = unsafe { msg_send![app_cls, sharedApplication] };
+                  if app.is_null() {
+                      return None;
+                  }
+                  let scenes: *mut AnyObject = unsafe { msg_send![app, connectedScenes] };
+                  if scenes.is_null() {
+                      return None;
+                  }
+                  let arr: *mut AnyObject = unsafe { msg_send![scenes, allObjects] };
+                  if arr.is_null() {
+                      return None;
+                  }
+                  let count: usize = unsafe { msg_send![arr, count] };
                   for index in 0..count {
-                      let obj: Retained<NSObject> = unsafe { msg_send![&*arr, objectAtIndex: index] };
+                      let obj: *mut AnyObject = unsafe { msg_send![arr, objectAtIndex: index] };
+                      if obj.is_null() {
+                          continue;
+                      }
                       // UISceneActivationStateForegroundActive = 0
-                      let state: isize = unsafe { msg_send![&*obj, activationState] };
+                      let state: isize = unsafe { msg_send![obj, activationState] };
                       if state == 0 {
                           return Some(obj);
                       }
@@ -131,48 +148,54 @@ jobs:
               /// 必须在主线程调用
               pub fn apply(code: i32) -> Result<(), String> {
                   MODE.store(code, Ordering::SeqCst);
-                  let orientation = super::ScreenOrientation::from_code(code);
-                  unsafe { request(orientation) }
+                  unsafe { request(super::ScreenOrientation::from_code(code)) }
               }
 
               unsafe fn request(orientation: super::ScreenOrientation) -> Result<(), String> {
                   let scene = unsafe { foreground_scene() }.ok_or("no active window scene")?;
                   let mask = orientation.mask();
 
-                  // iOS 16+：走 geometry update，系统方向锁开着也能转
+                  // iOS 16+：geometry update，系统方向锁开着也能转
                   if let Ok(prefs_cls) = cls(c"UIWindowSceneGeometryPreferencesIOS") {
-                      let alloc: Retained<NSObject> = unsafe { msg_send![prefs_cls, alloc] };
-                      let prefs: Retained<NSObject> =
-                          unsafe { msg_send![&*alloc, initWithInterfaceOrientations: mask] };
-                      {
-                          let handler = RcBlock::new(move |_error: *mut NSObject| {});
-                          let _: () = unsafe {
-                              msg_send![
-                                  &*scene,
-                                  requestGeometryUpdateWithPreferences: &*prefs,
-                                  errorHandler: &*handler
-                              ]
-                          };
-                          if let Ok(vc_cls) = cls(c"UIViewController") {
-                              let _: () = unsafe { msg_send![vc_cls, attemptRotationToDeviceOrientation] };
+                      let alloc: *mut AnyObject = unsafe { msg_send![prefs_cls, alloc] };
+                      if !alloc.is_null() {
+                          let prefs: *mut AnyObject =
+                              unsafe { msg_send![alloc, initWithInterfaceOrientations: mask] };
+                          if !prefs.is_null() {
+                              let handler = RcBlock::new(move |_error: *mut AnyObject| {});
+                              let _: () = unsafe {
+                                  msg_send![
+                                      scene,
+                                      requestGeometryUpdateWithPreferences: prefs,
+                                      errorHandler: &*handler
+                                  ]
+                              };
+                              if let Ok(vc_cls) = cls(c"UIViewController") {
+                                  let _: () = unsafe { msg_send![vc_cls, attemptRotationToDeviceOrientation] };
+                              }
+                              return Ok(());
                           }
-                          return Ok(());
                       }
                   }
 
-                  // iOS 15 及更早：KVC 改方向
+                  // iOS 15 及更早：KVC 改设备方向
                   let device_cls = cls(c"UIDevice")?;
-                  let device: Retained<NSObject> = unsafe { msg_send![device_cls, currentDevice] };
+                  let device: *mut AnyObject = unsafe { msg_send![device_cls, currentDevice] };
+                  if device.is_null() {
+                      return Err("UIDevice.currentDevice returned nil".to_string());
+                  }
                   let number_cls = cls(c"NSNumber")?;
                   let value: isize = match orientation {
-                      super::ScreenOrientation::Portrait => 1,    // UIInterfaceOrientationPortrait
-                      super::ScreenOrientation::Landscape => 4,   // UIInterfaceOrientationLandscapeRight
-                      super::ScreenOrientation::Auto => 0,        // unknown
+                      super::ScreenOrientation::Portrait => 1,   // UIInterfaceOrientationPortrait
+                      super::ScreenOrientation::Landscape => 4,  // UIInterfaceOrientationLandscapeRight
+                      super::ScreenOrientation::Auto => 0,       // unknown
                   };
-                  let number: Retained<NSObject> =
-                      unsafe { msg_send![number_cls, numberWithInteger: value] };
+                  let number: *mut AnyObject = unsafe { msg_send![number_cls, numberWithInteger: value] };
+                  if number.is_null() {
+                      return Err("NSNumber creation failed".to_string());
+                  }
                   let key = NSString::from_str("orientation");
-                  let _: () = unsafe { msg_send![&*device, setValue: &*number, forKey: &*key] };
+                  let _: () = unsafe { msg_send![device, setValue: number, forKey: &*key] };
                   if let Ok(vc_cls) = cls(c"UIViewController") {
                       let _: () = unsafe { msg_send![vc_cls, attemptRotationToDeviceOrientation] };
                   }
