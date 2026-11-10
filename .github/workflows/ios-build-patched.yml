@@ -102,7 +102,7 @@ jobs:
           #[cfg(target_os = "ios")]
           mod bridge {
               use std::ffi::CStr;
-              use std::sync::atomic::{AtomicI32, Ordering};
+              use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
               use block2::RcBlock;
               use objc2::msg_send;
@@ -110,6 +110,45 @@ jobs:
               use objc2_foundation::NSString;
 
               static MODE: AtomicI32 = AtomicI32::new(0);
+              static OBSERVERS: AtomicBool = AtomicBool::new(false);
+
+              /// 装一次通知监听：App 回到前台、或手机姿态变化时，把锁定方向重新顶回去。
+              /// 之前只调一次 geometry update，切后台/竖回来系统会按自己的判断转回竖屏，这就是“只锁了一半”的原因。
+              fn install_observers() {
+                  if OBSERVERS.swap(true, Ordering::SeqCst) {
+                      return;
+                  }
+                  let Some(center_cls) = AnyClass::get(c"NSNotificationCenter") else { return };
+                  let center: *mut AnyObject = unsafe { msg_send![center_cls, defaultCenter] };
+                  if center.is_null() {
+                      return;
+                  }
+                  for name in [
+                      "UIApplicationDidBecomeActiveNotification",
+                      "UIDeviceOrientationDidChangeNotification",
+                      "UIApplicationWillEnterForegroundNotification",
+                  ] {
+                      let ns_name = NSString::from_str(name);
+                      let handler = RcBlock::new(move |_note: *mut AnyObject| {
+                          let code = MODE.load(Ordering::SeqCst);
+                          if code == 0 {
+                              return;
+                          }
+                          if let Err(error) = unsafe { request(super::ScreenOrientation::from_code(code)) } {
+                              eprintln!("[orientation] re-apply failed: {error}");
+                          }
+                      });
+                      let _: *mut AnyObject = unsafe {
+                          msg_send![
+                              center,
+                              addObserverForName: &*ns_name,
+                              object: std::ptr::null_mut::<AnyObject>(),
+                              queue: std::ptr::null_mut::<AnyObject>(),
+                              usingBlock: &*handler
+                          ]
+                      };
+                  }
+              }
 
               fn cls(name: &CStr) -> Result<&'static AnyClass, String> {
                   AnyClass::get(name).ok_or_else(|| format!("class {name:?} unavailable"))
@@ -148,6 +187,7 @@ jobs:
               /// 必须在主线程调用
               pub fn apply(code: i32) -> Result<(), String> {
                   MODE.store(code, Ordering::SeqCst);
+                  install_observers();
                   unsafe { request(super::ScreenOrientation::from_code(code)) }
               }
 
