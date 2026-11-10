@@ -306,45 +306,37 @@ jobs:
       - name: Install JS dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build frontend bundle
-        run: node scripts/tauri-before-build.mjs
-
-      - name: Build unsigned app
+      - name: Build unsigned app (via tauri CLI)
+        env:
+          CI: "1"
         run: |
           set -o pipefail
-          xcodebuild \
-            -project src-tauri/crates/tauritavern/gen/apple/tauritavern.xcodeproj \
-            -scheme tauritavern_iOS \
-            -configuration release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath "$RUNNER_TEMP/tt-derived" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGN_IDENTITY="" \
-            EXPANDED_CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_ENTITLEMENTS="" \
-            DEVELOPMENT_TEAM="" \
-            ARCHS=arm64 \
-            ONLY_ACTIVE_ARCH=NO \
-            build
+          pnpm tauri ios build --no-sign --ci
 
       - name: Package unsigned IPA
         run: |
           set -euo pipefail
-          APP_DIR="$(find "$RUNNER_TEMP/tt-derived/Build/Products" -maxdepth 2 -name '*.app' -type d | head -n 1)"
-          if [[ -z "${APP_DIR}" ]]; then
-            echo "错误: 没找到构建产出的 .app" >&2
-            find "$RUNNER_TEMP/tt-derived/Build/Products" -maxdepth 3 -print >&2
-            exit 1
+          IPA="$(find . -path ./node_modules -prune -o -name '*.ipa' -print | head -n 1)"
+          if [[ -n "${IPA:-}" && -f "$IPA" ]]; then
+            echo "找到 IPA: $IPA"
+            cp "$IPA" TauriTavern-ios-unsigned.ipa
+          else
+            echo "cli 没产出 ipa，回退到手工打包 .app" >&2
+            APP_DIR="$(find src-tauri -path '*/node_modules' -prune -o -name '*.app' -type d -print | head -n 1)"
+            if [[ -z "${APP_DIR:-}" ]]; then
+              echo "错误: 既没找到 ipa 也没找到 .app" >&2
+              exit 1
+            fi
+            APP_NAME="$(basename "$APP_DIR" .app)"
+            echo "APP_DIR=$APP_DIR"
+            rm -rf stage
+            mkdir -p stage/Payload
+            cp -R "$APP_DIR" "stage/Payload/"
+            rm -rf "stage/Payload/${APP_NAME}.app/_CodeSignature"
+            ( cd stage && ditto -c -k --sequesterRsrc --keepParent "Payload/${APP_NAME}.app" "../TauriTavern-ios-unsigned.ipa" )
           fi
-          APP_NAME="$(basename "${APP_DIR}" .app)"
-          echo "APP_DIR=${APP_DIR}"
-          mkdir -p stage/Payload
-          cp -R "${APP_DIR}" "stage/Payload/"
-          rm -rf "stage/Payload/${APP_NAME}.app/_CodeSignature"
-          ( cd stage && ditto -c -k --sequesterRsrc --keepParent "Payload/${APP_NAME}.app" "../TauriTavern-ios-unsigned.ipa" )
           ls -lh TauriTavern-ios-unsigned.ipa
+          unzip -l TauriTavern-ios-unsigned.ipa | head -n 12
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
