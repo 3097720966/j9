@@ -1,0 +1,355 @@
+name: Build unsigned iOS IPA (patched)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    runs-on: macos-14
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Rust toolchain (iOS target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Apply screen orientation patch
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          CRATE="src-tauri/crates/tauritavern"
+
+          cat > "$CRATE/gen/apple/Sources/tauritavern/main.mm" <<'TT_MAIN_MM'
+          #import <UIKit/UIKit.h>
+          #import <objc/runtime.h>
+
+          #include "bindings/bindings.h"
+
+          // ---------------------------------------------------------------------------
+          // TauriTavern 屏幕方向桥（本地补丁，非上游代码）
+          //
+          //   tt_set_screen_orientation(0)  跟随系统 / 恢复 plist 声明的方向
+          //   tt_set_screen_orientation(1)  锁定竖屏
+          //   tt_set_screen_orientation(2)  锁定横屏
+          //
+          // 原理：
+          //   1) 改写根视图控制器的 -supportedInterfaceOrientations，让 UIKIt 只认锁定后的 mask；
+          //   2) iOS 16+ 通过 UIWindowScene requestGeometryUpdateWithPreferences 立即旋转；
+          //   3) iOS 15 用 UIDevice 的经典 KVC 兜底（系统私有行为，不保证在所有机型生效）。
+          //
+          // 只在本机自签安装时使用；上游合并前请勿签名分发。
+          // ---------------------------------------------------------------------------
+
+          static NSUInteger TTLockedMask = 0;
+
+          static UIWindow *TTKeyWindow(void) {
+          	UIApplication *application = UIApplication.sharedApplication;
+          	UIWindow *fallback = nil;
+          	for (UIWindow *window in application.windows) {
+          		if (window.isKeyWindow) {
+          			return window;
+          		}
+          		if (fallback == nil) {
+          			fallback = window;
+          		}
+          	}
+          	return fallback;
+          }
+
+          static NSUInteger TTDefaultMask(void) {
+          	// 与 gen/apple 工程里声明的 iPhone 方向保持一致
+          	return UIInterfaceOrientationMaskPortrait
+          		| UIInterfaceOrientationMaskLandscapeLeft
+          		| UIInterfaceOrientationMaskLandscapeRight;
+          }
+
+          static NSUInteger TTSupportedInterfaceOrientations(id self, SEL _cmd) {
+          	(void)self;
+          	(void)_cmd;
+          	if (TTLockedMask != 0) {
+          		return TTLockedMask;
+          	}
+          	return TTDefaultMask();
+          }
+
+          static void TTInstallOrientationOverride(UIViewController *viewController) {
+          	if (viewController == nil) {
+          		return;
+          	}
+          	Class cls = object_getClass(viewController);
+          	Method method = class_getInstanceMethod(cls, @selector(supportedInterfaceOrientations));
+          	if (method != NULL) {
+          		method_setImplementation(method, (IMP)TTSupportedInterfaceOrientations);
+          	} else {
+          		class_addMethod(cls,
+          			@selector(supportedInterfaceOrientations),
+          			(IMP)TTSupportedInterfaceOrientations,
+          			"Q@:");
+          	}
+          }
+
+          static void TTRefreshOrientation(void) {
+          	if (@available(iOS 16.0, *)) {
+          		UIViewController *root = TTKeyWindow().rootViewController;
+          		if (root != nil) {
+          			[root setNeedsUpdateOfSupportedInterfaceOrientations];
+          		}
+          	}
+          }
+
+          static void TTRequestGeometry(NSUInteger mask) {
+          	UIWindow *window = TTKeyWindow();
+          	UIViewController *root = window.rootViewController;
+          	TTInstallOrientationOverride(root);
+
+          	if (@available(iOS 16.0, *)) {
+          		UIWindowScene *scene = window.windowScene;
+          		if (scene != nil) {
+          			UIWindowSceneGeometryPreferencesIOS *preferences =
+          				[[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:mask];
+          			[scene requestGeometryUpdateWithPreferences:preferences
+          			                             errorHandler:^(NSError *error) {
+          				NSLog(@"[tt-orientation] requestGeometryUpdate failed: %@", error);
+          			}];
+          			[root setNeedsUpdateOfSupportedInterfaceOrientations];
+          			return;
+          		}
+          	}
+
+          	// iOS 15 兜底：KVC 改写设备方向（私有行为，可能被系统忽略）
+          	UIInterfaceOrientation orientation = UIInterfaceOrientationPortrait;
+          	if ((mask & UIInterfaceOrientationMaskLandscape) != 0) {
+          		orientation = UIInterfaceOrientationLandscapeRight;
+          	}
+          	[[UIDevice currentDevice] setValue:@(orientation) forKey:@"orientation"];
+          }
+
+          extern "C" int tt_set_screen_orientation(int mode) {
+          	dispatch_async(dispatch_get_main_queue(), ^{
+          		switch (mode) {
+          			case 1:
+          				TTLockedMask = UIInterfaceOrientationMaskPortrait;
+          				TTRequestGeometry(TTLockedMask);
+          				break;
+          			case 2:
+          				TTLockedMask = UIInterfaceOrientationMaskLandscape;
+          				TTRequestGeometry(TTLockedMask);
+          				break;
+          			default:
+          				TTLockedMask = 0;
+          				TTRefreshOrientation();
+          				break;
+          		}
+          	});
+          	return 0;
+          }
+
+          extern "C" int tt_get_screen_orientation(void) {
+          	if (TTLockedMask == 0) {
+          		return 0;
+          	}
+          	if (TTLockedMask == UIInterfaceOrientationMaskPortrait) {
+          		return 1;
+          	}
+          	return 2;
+          }
+
+          int main(int argc, char * argv[]) {
+          	ffi::start_app();
+          	return 0;
+          }
+          TT_MAIN_MM
+
+          cat > "$CRATE/src/platform/orientation.rs" <<'TT_ORIENT_RS'
+          //! 屏幕方向桥（本地补丁，非上游代码）。
+          //!
+          //! iOS 侧实现在 `gen/apple/Sources/tauritavern/main.mm` 的 `tt_set_screen_orientation`。
+          //! 其它平台目前只返回“不支持”。
+
+          #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+          pub enum ScreenOrientation {
+              /// 跟随系统 / 恢复 plist 声明的方向
+              Auto,
+              Portrait,
+              Landscape,
+          }
+
+          impl ScreenOrientation {
+              pub fn parse(value: &str) -> Result<Self, String> {
+                  match value.trim().to_ascii_lowercase().as_str() {
+                      "" | "auto" | "unlock" | "system" => Ok(Self::Auto),
+                      "portrait" | "vertical" => Ok(Self::Portrait),
+                      "landscape" | "horizontal" => Ok(Self::Landscape),
+                      other => Err(format!("unsupported screen orientation: {other}")),
+                  }
+              }
+
+              fn code(self) -> i32 {
+                  match self {
+                      Self::Auto => 0,
+                      Self::Portrait => 1,
+                      Self::Landscape => 2,
+                  }
+              }
+          }
+
+          #[cfg(target_os = "ios")]
+          unsafe extern "C" {
+              fn tt_set_screen_orientation(mode: i32) -> i32;
+              fn tt_get_screen_orientation() -> i32;
+          }
+
+          pub fn set(orientation: ScreenOrientation) -> Result<(), String> {
+              #[cfg(target_os = "ios")]
+              {
+                  // SAFETY: 补丁里的实现只做 dispatch_async 到主线程，任意线程调用都是安全的。
+                  unsafe { tt_set_screen_orientation(orientation.code()) };
+                  Ok(())
+              }
+              #[cfg(not(target_os = "ios"))]
+              {
+                  let _ = orientation;
+                  Err("screen orientation lock is only available on iOS".to_string())
+              }
+          }
+
+          pub fn current() -> Result<ScreenOrientation, String> {
+              #[cfg(target_os = "ios")]
+              {
+                  let code = unsafe { tt_get_screen_orientation() };
+                  Ok(match code {
+                      1 => ScreenOrientation::Portrait,
+                      2 => ScreenOrientation::Landscape,
+                      _ => ScreenOrientation::Auto,
+                  })
+              }
+              #[cfg(not(target_os = "ios"))]
+              {
+                  Ok(ScreenOrientation::Auto)
+              }
+          }
+          TT_ORIENT_RS
+
+          cat > "$CRATE/src/presentation/commands/orientation_commands.rs" <<'TT_CMD_RS'
+          //! 屏幕方向命令（本地补丁，非上游代码）。
+
+          use crate::platform::orientation::{self, ScreenOrientation};
+
+          /// 锁定 / 恢复屏幕方向。
+          /// `mode`: `"auto"` | `"portrait"` | `"landscape"`
+          #[tauri::command]
+          pub fn set_screen_orientation(mode: String) -> Result<(), String> {
+              let orientation = ScreenOrientation::parse(&mode)?;
+              orientation::set(orientation)
+          }
+
+          /// 读取当前锁定状态。
+          #[tauri::command]
+          pub fn get_screen_orientation() -> Result<String, String> {
+              let current = orientation::current()?;
+              let value = match current {
+                  ScreenOrientation::Auto => "auto",
+                  ScreenOrientation::Portrait => "portrait",
+                  ScreenOrientation::Landscape => "landscape",
+              };
+              Ok(value.to_string())
+          }
+          TT_CMD_RS
+
+          python3 - "$CRATE" <<'TT_PY'
+          import pathlib, sys
+          crate = pathlib.Path(sys.argv[1])
+
+          def ensure_line(path, anchor, line):
+              text = path.read_text(encoding="utf-8")
+              if line.strip() in text:
+                  print("skip:", path.name)
+                  return
+              if anchor not in text:
+                  raise SystemExit(f"anchor not found in {path}: {anchor!r}")
+              path.write_text(text.replace(anchor, anchor + "\n" + line, 1), encoding="utf-8")
+              print("patched:", path.name)
+
+          ensure_line(crate/"src/platform/mod.rs", "pub mod lan_discovery;", "pub mod orientation;")
+          ensure_line(crate/"src/presentation/commands/mod.rs", "pub mod mcp_commands;", "pub mod orientation_commands;")
+          ensure_line(
+              crate/"src/presentation/commands/registry.rs",
+              "super::window_layout_commands::set_window_backdrop,",
+              "        super::orientation_commands::set_screen_orientation,\n"
+              "        super::orientation_commands::get_screen_orientation,",
+          )
+          TT_PY
+
+          grep -n "orientation" "$CRATE/src/platform/mod.rs" "$CRATE/src/presentation/commands/registry.rs" | head -5
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend bundle
+        run: node scripts/tauri-before-build.mjs
+
+      - name: Build unsigned app
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project src-tauri/crates/tauritavern/gen/apple/tauritavern.xcodeproj \
+            -scheme tauritavern_iOS \
+            -configuration release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/tt-derived" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP_DIR="$(find "$RUNNER_TEMP/tt-derived/Build/Products" -maxdepth 2 -name '*.app' -type d | head -n 1)"
+          if [[ -z "${APP_DIR}" ]]; then
+            echo "错误: 没找到构建产出的 .app" >&2
+            find "$RUNNER_TEMP/tt-derived/Build/Products" -maxdepth 3 -print >&2
+            exit 1
+          fi
+          APP_NAME="$(basename "${APP_DIR}" .app)"
+          echo "APP_DIR=${APP_DIR}"
+          mkdir -p stage/Payload
+          cp -R "${APP_DIR}" "stage/Payload/"
+          rm -rf "stage/Payload/${APP_NAME}.app/_CodeSignature"
+          ( cd stage && ditto -c -k --sequesterRsrc --keepParent "Payload/${APP_NAME}.app" "../TauriTavern-ios-unsigned.ipa" )
+          ls -lh TauriTavern-ios-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: TauriTavern-ios-unsigned
+          path: TauriTavern-ios-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
