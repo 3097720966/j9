@@ -40,167 +40,16 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           CRATE="src-tauri/crates/tauritavern"
 
-          cat > "$CRATE/gen/apple/Sources/tauritavern/main.mm" <<'TT_MAIN_MM'
-          #import <UIKit/UIKit.h>
-          #import <objc/runtime.h>
-
-          #include "bindings/bindings.h"
-
-          // ---------------------------------------------------------------------------
-          // TauriTavern 屏幕方向桥（本地补丁，非上游代码）
-          //
-          //   tt_set_screen_orientation(0)  跟随系统 / 恢复 plist 声明的方向
-          //   tt_set_screen_orientation(1)  锁定竖屏
-          //   tt_set_screen_orientation(2)  锁定横屏
-          //
-          // 原理：
-          //   1) 改写根视图控制器的 -supportedInterfaceOrientations，让 UIKIt 只认锁定后的 mask；
-          //   2) iOS 16+ 通过 UIWindowScene requestGeometryUpdateWithPreferences 立即旋转；
-          //   3) iOS 15 用 UIDevice 的经典 KVC 兜底（系统私有行为，不保证在所有机型生效）。
-          //
-          // 只在本机自签安装时使用；上游合并前请勿签名分发。
-          // ---------------------------------------------------------------------------
-
-          static NSUInteger TTLockedMask = 0;
-
-          static UIWindow *TTKeyWindow(void) {
-          	UIApplication *application = UIApplication.sharedApplication;
-          	UIWindow *fallback = nil;
-          	for (UIWindow *window in application.windows) {
-          		if (window.isKeyWindow) {
-          			return window;
-          		}
-          		if (fallback == nil) {
-          			fallback = window;
-          		}
-          	}
-          	return fallback;
-          }
-
-          static NSUInteger TTDefaultMask(void) {
-          	// 与 gen/apple 工程里声明的 iPhone 方向保持一致
-          	return UIInterfaceOrientationMaskPortrait
-          		| UIInterfaceOrientationMaskLandscapeLeft
-          		| UIInterfaceOrientationMaskLandscapeRight;
-          }
-
-          static NSUInteger TTSupportedInterfaceOrientations(id self, SEL _cmd) {
-          	(void)self;
-          	(void)_cmd;
-          	if (TTLockedMask != 0) {
-          		return TTLockedMask;
-          	}
-          	return TTDefaultMask();
-          }
-
-          static void TTInstallOrientationOverride(UIViewController *viewController) {
-          	if (viewController == nil) {
-          		return;
-          	}
-          	Class cls = object_getClass(viewController);
-          	Method method = class_getInstanceMethod(cls, @selector(supportedInterfaceOrientations));
-          	if (method != NULL) {
-          		method_setImplementation(method, (IMP)TTSupportedInterfaceOrientations);
-          	} else {
-          		class_addMethod(cls,
-          			@selector(supportedInterfaceOrientations),
-          			(IMP)TTSupportedInterfaceOrientations,
-          			"Q@:");
-          	}
-          }
-
-          static void TTRefreshOrientation(void) {
-          	if (@available(iOS 16.0, *)) {
-          		UIViewController *root = TTKeyWindow().rootViewController;
-          		if (root != nil) {
-          			[root setNeedsUpdateOfSupportedInterfaceOrientations];
-          		}
-          	}
-          }
-
-          static void TTRequestGeometry(NSUInteger mask) {
-          	UIWindow *window = TTKeyWindow();
-          	UIViewController *root = window.rootViewController;
-          	TTInstallOrientationOverride(root);
-
-          	if (@available(iOS 16.0, *)) {
-          		UIWindowScene *scene = window.windowScene;
-          		if (scene != nil) {
-          			UIWindowSceneGeometryPreferencesIOS *preferences =
-          				[[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:mask];
-          			[scene requestGeometryUpdateWithPreferences:preferences
-          			                             errorHandler:^(NSError *error) {
-          				NSLog(@"[tt-orientation] requestGeometryUpdate failed: %@", error);
-          			}];
-          			[root setNeedsUpdateOfSupportedInterfaceOrientations];
-          			return;
-          		}
-          	}
-
-          	// iOS 15 兜底：KVC 改写设备方向（私有行为，可能被系统忽略）
-          	UIInterfaceOrientation orientation = UIInterfaceOrientationPortrait;
-          	if ((mask & UIInterfaceOrientationMaskLandscape) != 0) {
-          		orientation = UIInterfaceOrientationLandscapeRight;
-          	}
-          	[[UIDevice currentDevice] setValue:@(orientation) forKey:@"orientation"];
-          }
-
-          extern "C" __attribute__((visibility("default")))
-          int tt_set_screen_orientation(int mode) {
-          	dispatch_async(dispatch_get_main_queue(), ^{
-          		switch (mode) {
-          			case 1:
-          				TTLockedMask = UIInterfaceOrientationMaskPortrait;
-          				TTRequestGeometry(TTLockedMask);
-          				break;
-          			case 2:
-          				TTLockedMask = UIInterfaceOrientationMaskLandscape;
-          				TTRequestGeometry(TTLockedMask);
-          				break;
-          			default:
-          				TTLockedMask = 0;
-          				TTRefreshOrientation();
-          				break;
-          		}
-          	});
-          	return 0;
-          }
-
-          extern "C" __attribute__((visibility("default")))
-          int tt_get_screen_orientation(void) {
-          	if (TTLockedMask == 0) {
-          		return 0;
-          	}
-          	if (TTLockedMask == UIInterfaceOrientationMaskPortrait) {
-          		return 1;
-          	}
-          	return 2;
-          }
-
-          // Rust 侧用 dlsym 动态查找这两个函数，这里放一个静态引用，
-          // 防止链接器和 dead_strip 把符号优化掉。
-          __attribute__((used)) static void *const TTKeepBridgeSymbols[] = {
-          	(void *)&tt_set_screen_orientation,
-          	(void *)&tt_get_screen_orientation,
-          };
-
-          int main(int argc, char * argv[]) {
-          	ffi::start_app();
-          	return 0;
-          }
-          TT_MAIN_MM
 
           cat > "$CRATE/src/platform/orientation.rs" <<'TT_ORIENT_RS'
-          //! 屏幕方向桥（本地补丁，非上游代码）。
+          //! 屏幕方向控制（本地补丁，非上游代码）。
           //!
-          //! iOS 侧实现在 `gen/apple/Sources/tauritavern/main.mm` 的 `tt_set_screen_orientation` /
-          //! `tt_get_screen_orientation`。Rust 库是 dylib，编译时看不到 App 侧的符号，
-          //! 所以这里用 dlsym 运行时查找，避免链接期 undefined symbol。
-          //! 其它平台只返回“不支持”。
+          //! 全部走 objc2 直接调用 UIKit，不依赖 App target 里的 C 符号，
+          //! 因此不会出现链接期 undefined symbol，也不受 -dead_strip / 符号可见性影响。
 
           #[derive(Clone, Copy, Debug, PartialEq, Eq)]
           pub enum ScreenOrientation {
-              /// 跟随系统 / 恢复 plist 声明的方向
+              /// 跟随系统（恢复三方向支持）
               Auto,
               Portrait,
               Landscape,
@@ -216,105 +65,171 @@ jobs:
                   }
               }
 
-              fn code(self) -> i32 {
+              pub fn code(self) -> i32 {
                   match self {
                       Self::Auto => 0,
                       Self::Portrait => 1,
                       Self::Landscape => 2,
                   }
               }
+
+              pub fn from_code(code: i32) -> Self {
+                  match code {
+                      1 => Self::Portrait,
+                      2 => Self::Landscape,
+                      _ => Self::Auto,
+                  }
+              }
+
+              #[cfg(target_os = "ios")]
+              fn mask(self) -> usize {
+                  // UIInterfaceOrientationMask：Portrait = 1<<1，LandscapeLeft = 1<<4，LandscapeRight = 1<<3
+                  const PORTRAIT: usize = 1 << 1;
+                  const LANDSCAPE: usize = (1 << 4) | (1 << 3);
+                  match self {
+                      Self::Portrait => PORTRAIT,
+                      Self::Landscape => LANDSCAPE,
+                      Self::Auto => PORTRAIT | LANDSCAPE,
+                  }
+              }
           }
 
           #[cfg(target_os = "ios")]
           mod bridge {
-              use core::ffi::{c_char, c_void};
+              use std::sync::atomic::{AtomicI32, Ordering};
 
-              // RTLD_DEFAULT：在当前进程已加载的所有镜像里查找符号
-              const RTLD_DEFAULT_OFFSET: isize = -2;
+              use block2::RcBlock;
+              use objc2::msg_send;
+              use objc2::rc::Retained;
+              use objc2::runtime::{AnyClass, AnyObject};
+              use objc2_foundation::NSString;
 
-              unsafe extern "C" {
-                  fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+              static MODE: AtomicI32 = AtomicI32::new(0);
+
+              fn cls(name: &std::ffi::CStr) -> Result<&'static AnyClass, String> {
+                  AnyClass::get(name).ok_or_else(|| format!("class {name:?} unavailable"))
               }
 
-              type SetFn = unsafe extern "C" fn(i32) -> i32;
-              type GetFn = unsafe extern "C" fn() -> i32;
-
-              fn find(name: &[u8]) -> Option<*mut c_void> {
-                  // SAFETY: name 是以 NUL 结尾的合法 C 字符串字面量。
-                  let p = unsafe { dlsym(RTLD_DEFAULT_OFFSET as *mut c_void, name.as_ptr() as *const c_char) };
-                  if p.is_null() {
-                      None
-                  } else {
-                      Some(p)
-                  }
-              }
-
-              const MISSING: &str = "orientation bridge is not compiled into this build";
-
-              pub fn set_code(code: i32) -> Result<(), String> {
-                  match find(b"tt_set_screen_orientation\0") {
-                      // SAFETY: 符号由 main.mm 导出，签名与声明一致。
-                      Some(sym) => {
-                          let f: SetFn = unsafe { core::mem::transmute(sym) };
-                          unsafe { f(code) };
-                          Ok(())
+              /// 取当前处于前台活跃状态的 UIScene（iOS 13+）
+              unsafe fn foreground_scene() -> Option<Retained<AnyObject>> {
+                  let app_cls = AnyClass::get(c"UIApplication")?;
+                  let app: Option<Retained<AnyObject>> = unsafe { msg_send![app_cls, sharedApplication] };
+                  let app = app?;
+                  let scenes: Option<Retained<AnyObject>> = unsafe { msg_send![&*app, connectedScenes] };
+                  let scenes = scenes?;
+                  let arr: Option<Retained<AnyObject>> = unsafe { msg_send![&*scenes, allObjects] };
+                  let arr = arr?;
+                  let count: usize = unsafe { msg_send![&*arr, count] };
+                  for index in 0..count {
+                      let obj: Option<Retained<AnyObject>> = unsafe { msg_send![&*arr, objectAtIndex: index] };
+                      let Some(obj) = obj else { continue };
+                      // UISceneActivationStateForegroundActive = 0
+                      let state: isize = unsafe { msg_send![&*obj, activationState] };
+                      if state == 0 {
+                          return Some(obj);
                       }
-                      None => Err(MISSING.to_string()),
                   }
+                  None
               }
 
-              pub fn get_code() -> Result<i32, String> {
-                  match find(b"tt_get_screen_orientation\0") {
-                      // SAFETY: 同上。
-                      Some(sym) => {
-                          let f: GetFn = unsafe { core::mem::transmute(sym) };
-                          Ok(unsafe { f() })
+              /// 必须在主线程调用
+              pub fn apply(code: i32) -> Result<(), String> {
+                  MODE.store(code, Ordering::SeqCst);
+                  let orientation = super::ScreenOrientation::from_code(code);
+                  unsafe { request(orientation) }
+              }
+
+              unsafe fn request(orientation: super::ScreenOrientation) -> Result<(), String> {
+                  let scene = unsafe { foreground_scene() }.ok_or("no active window scene")?;
+                  let mask = orientation.mask();
+
+                  // iOS 16+：走 geometry update，系统方向锁开着也能转
+                  if let Ok(prefs_cls) = cls(c"UIWindowSceneGeometryPreferencesIOS") {
+                      let alloc: Retained<AnyObject> = unsafe { msg_send![prefs_cls, alloc] };
+                      let prefs: Option<Retained<AnyObject>> =
+                          unsafe { msg_send![&*alloc, initWithInterfaceOrientations: mask] };
+                      if let Some(prefs) = prefs {
+                          let handler = RcBlock::new(move |_error: *mut AnyObject| {});
+                          let _: () = unsafe {
+                              msg_send![
+                                  &*scene,
+                                  requestGeometryUpdateWithPreferences: &*prefs,
+                                  errorHandler: &*handler
+                              ]
+                          };
+                          if let Ok(vc_cls) = cls(c"UIViewController") {
+                              let _: () = unsafe { msg_send![vc_cls, attemptRotationToDeviceOrientation] };
+                          }
+                          return Ok(());
                       }
-                      None => Err(MISSING.to_string()),
                   }
+
+                  // iOS 15 及更早：KVC 改方向
+                  let device_cls = cls(c"UIDevice")?;
+                  let device: Option<Retained<AnyObject>> = unsafe { msg_send![device_cls, currentDevice] };
+                  let device = device.ok_or("UIDevice.currentDevice returned null")?;
+                  let number_cls = cls(c"NSNumber")?;
+                  let value: isize = match orientation {
+                      super::ScreenOrientation::Portrait => 1,    // UIInterfaceOrientationPortrait
+                      super::ScreenOrientation::Landscape => 4,   // UIInterfaceOrientationLandscapeRight
+                      super::ScreenOrientation::Auto => 0,        // unknown
+                  };
+                  let number: Option<Retained<AnyObject>> =
+                      unsafe { msg_send![number_cls, numberWithInteger: value] };
+                  let number = number.ok_or("NSNumber creation failed")?;
+                  let key = NSString::from_str("orientation");
+                  let _: () = unsafe { msg_send![&*device, setValue: &*number, forKey: &*key] };
+                  if let Ok(vc_cls) = cls(c"UIViewController") {
+                      let _: () = unsafe { msg_send![vc_cls, attemptRotationToDeviceOrientation] };
+                  }
+                  Ok(())
+              }
+
+              pub fn mode_code() -> i32 {
+                  MODE.load(Ordering::SeqCst)
               }
           }
 
+          #[cfg(target_os = "ios")]
           pub fn set(orientation: ScreenOrientation) -> Result<(), String> {
-              #[cfg(target_os = "ios")]
-              {
-                  bridge::set_code(orientation.code())
-              }
-              #[cfg(not(target_os = "ios"))]
-              {
-                  let _ = orientation;
-                  Err("screen orientation lock is only available on iOS".to_string())
-              }
+              bridge::apply(orientation.code())
           }
 
+          #[cfg(not(target_os = "ios"))]
+          pub fn set(orientation: ScreenOrientation) -> Result<(), String> {
+              let _ = orientation;
+              Err("screen orientation lock is only available on iOS".to_string())
+          }
+
+          #[cfg(target_os = "ios")]
           pub fn current() -> Result<ScreenOrientation, String> {
-              #[cfg(target_os = "ios")]
-              {
-                  let code = bridge::get_code()?;
-                  Ok(match code {
-                      1 => ScreenOrientation::Portrait,
-                      2 => ScreenOrientation::Landscape,
-                      _ => ScreenOrientation::Auto,
-                  })
-              }
-              #[cfg(not(target_os = "ios"))]
-              {
-                  Ok(ScreenOrientation::Auto)
-              }
+              Ok(ScreenOrientation::from_code(bridge::mode_code()))
+          }
+
+          #[cfg(not(target_os = "ios"))]
+          pub fn current() -> Result<ScreenOrientation, String> {
+              Ok(ScreenOrientation::Auto)
           }
           TT_ORIENT_RS
 
           cat > "$CRATE/src/presentation/commands/orientation_commands.rs" <<'TT_CMD_RS'
           //! 屏幕方向命令（本地补丁，非上游代码）。
 
+          use tauri::AppHandle;
+
           use crate::platform::orientation::{self, ScreenOrientation};
 
           /// 锁定 / 恢复屏幕方向。
           /// `mode`: `"auto"` | `"portrait"` | `"landscape"`
           #[tauri::command]
-          pub fn set_screen_orientation(mode: String) -> Result<(), String> {
+          pub fn set_screen_orientation(app: AppHandle, mode: String) -> Result<(), String> {
               let orientation = ScreenOrientation::parse(&mode)?;
-              orientation::set(orientation)
+              app.run_on_main_thread(move || {
+                  if let Err(error) = orientation::set(orientation) {
+                      eprintln!("[orientation] set failed: {error}");
+                  }
+              })
+              .map_err(|error| error.to_string())
           }
 
           /// 读取当前锁定状态。
