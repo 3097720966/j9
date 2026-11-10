@@ -113,16 +113,12 @@ jobs:
               /// 取当前处于前台活跃状态的 UIScene（iOS 13+）
               unsafe fn foreground_scene() -> Option<Retained<AnyObject>> {
                   let app_cls = AnyClass::get(c"UIApplication")?;
-                  let app: Option<Retained<AnyObject>> = unsafe { msg_send![app_cls, sharedApplication] };
-                  let app = app?;
-                  let scenes: Option<Retained<AnyObject>> = unsafe { msg_send![&*app, connectedScenes] };
-                  let scenes = scenes?;
-                  let arr: Option<Retained<AnyObject>> = unsafe { msg_send![&*scenes, allObjects] };
-                  let arr = arr?;
+                  let app: Retained<AnyObject> = unsafe { msg_send![app_cls, sharedApplication] };
+                  let scenes: Retained<AnyObject> = unsafe { msg_send![&*app, connectedScenes] };
+                  let arr: Retained<AnyObject> = unsafe { msg_send![&*scenes, allObjects] };
                   let count: usize = unsafe { msg_send![&*arr, count] };
                   for index in 0..count {
-                      let obj: Option<Retained<AnyObject>> = unsafe { msg_send![&*arr, objectAtIndex: index] };
-                      let Some(obj) = obj else { continue };
+                      let obj: Retained<AnyObject> = unsafe { msg_send![&*arr, objectAtIndex: index] };
                       // UISceneActivationStateForegroundActive = 0
                       let state: isize = unsafe { msg_send![&*obj, activationState] };
                       if state == 0 {
@@ -146,9 +142,9 @@ jobs:
                   // iOS 16+：走 geometry update，系统方向锁开着也能转
                   if let Ok(prefs_cls) = cls(c"UIWindowSceneGeometryPreferencesIOS") {
                       let alloc: Retained<AnyObject> = unsafe { msg_send![prefs_cls, alloc] };
-                      let prefs: Option<Retained<AnyObject>> =
+                      let prefs: Retained<AnyObject> =
                           unsafe { msg_send![&*alloc, initWithInterfaceOrientations: mask] };
-                      if let Some(prefs) = prefs {
+                      {
                           let handler = RcBlock::new(move |_error: *mut AnyObject| {});
                           let _: () = unsafe {
                               msg_send![
@@ -166,17 +162,15 @@ jobs:
 
                   // iOS 15 及更早：KVC 改方向
                   let device_cls = cls(c"UIDevice")?;
-                  let device: Option<Retained<AnyObject>> = unsafe { msg_send![device_cls, currentDevice] };
-                  let device = device.ok_or("UIDevice.currentDevice returned null")?;
+                  let device: Retained<AnyObject> = unsafe { msg_send![device_cls, currentDevice] };
                   let number_cls = cls(c"NSNumber")?;
                   let value: isize = match orientation {
                       super::ScreenOrientation::Portrait => 1,    // UIInterfaceOrientationPortrait
                       super::ScreenOrientation::Landscape => 4,   // UIInterfaceOrientationLandscapeRight
                       super::ScreenOrientation::Auto => 0,        // unknown
                   };
-                  let number: Option<Retained<AnyObject>> =
+                  let number: Retained<AnyObject> =
                       unsafe { msg_send![number_cls, numberWithInteger: value] };
-                  let number = number.ok_or("NSNumber creation failed")?;
                   let key = NSString::from_str("orientation");
                   let _: () = unsafe { msg_send![&*device, setValue: &*number, forKey: &*key] };
                   if let Ok(vc_cls) = cls(c"UIViewController") {
