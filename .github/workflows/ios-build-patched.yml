@@ -101,8 +101,8 @@ jobs:
               use block2::RcBlock;
               use objc2::msg_send;
               use objc2::rc::Retained;
-              use objc2::runtime::{AnyClass, AnyObject};
-              use objc2_foundation::NSString;
+              use objc2::runtime::AnyClass;
+              use objc2_foundation::{NSObject, NSString};
 
               static MODE: AtomicI32 = AtomicI32::new(0);
 
@@ -111,14 +111,14 @@ jobs:
               }
 
               /// 取当前处于前台活跃状态的 UIScene（iOS 13+）
-              unsafe fn foreground_scene() -> Option<Retained<AnyObject>> {
+              unsafe fn foreground_scene() -> Option<Retained<NSObject>> {
                   let app_cls = AnyClass::get(c"UIApplication")?;
-                  let app: Retained<AnyObject> = unsafe { msg_send![app_cls, sharedApplication] };
-                  let scenes: Retained<AnyObject> = unsafe { msg_send![&*app, connectedScenes] };
-                  let arr: Retained<AnyObject> = unsafe { msg_send![&*scenes, allObjects] };
+                  let app: Retained<NSObject> = unsafe { msg_send![app_cls, sharedApplication] };
+                  let scenes: Retained<NSObject> = unsafe { msg_send![&*app, connectedScenes] };
+                  let arr: Retained<NSObject> = unsafe { msg_send![&*scenes, allObjects] };
                   let count: usize = unsafe { msg_send![&*arr, count] };
                   for index in 0..count {
-                      let obj: Retained<AnyObject> = unsafe { msg_send![&*arr, objectAtIndex: index] };
+                      let obj: Retained<NSObject> = unsafe { msg_send![&*arr, objectAtIndex: index] };
                       // UISceneActivationStateForegroundActive = 0
                       let state: isize = unsafe { msg_send![&*obj, activationState] };
                       if state == 0 {
@@ -141,11 +141,11 @@ jobs:
 
                   // iOS 16+：走 geometry update，系统方向锁开着也能转
                   if let Ok(prefs_cls) = cls(c"UIWindowSceneGeometryPreferencesIOS") {
-                      let alloc: Retained<AnyObject> = unsafe { msg_send![prefs_cls, alloc] };
-                      let prefs: Retained<AnyObject> =
+                      let alloc: Retained<NSObject> = unsafe { msg_send![prefs_cls, alloc] };
+                      let prefs: Retained<NSObject> =
                           unsafe { msg_send![&*alloc, initWithInterfaceOrientations: mask] };
                       {
-                          let handler = RcBlock::new(move |_error: *mut AnyObject| {});
+                          let handler = RcBlock::new(move |_error: *mut NSObject| {});
                           let _: () = unsafe {
                               msg_send![
                                   &*scene,
@@ -162,14 +162,14 @@ jobs:
 
                   // iOS 15 及更早：KVC 改方向
                   let device_cls = cls(c"UIDevice")?;
-                  let device: Retained<AnyObject> = unsafe { msg_send![device_cls, currentDevice] };
+                  let device: Retained<NSObject> = unsafe { msg_send![device_cls, currentDevice] };
                   let number_cls = cls(c"NSNumber")?;
                   let value: isize = match orientation {
                       super::ScreenOrientation::Portrait => 1,    // UIInterfaceOrientationPortrait
                       super::ScreenOrientation::Landscape => 4,   // UIInterfaceOrientationLandscapeRight
                       super::ScreenOrientation::Auto => 0,        // unknown
                   };
-                  let number: Retained<AnyObject> =
+                  let number: Retained<NSObject> =
                       unsafe { msg_send![number_cls, numberWithInteger: value] };
                   let key = NSString::from_str("orientation");
                   let _: () = unsafe { msg_send![&*device, setValue: &*number, forKey: &*key] };
